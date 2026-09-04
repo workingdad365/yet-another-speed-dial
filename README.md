@@ -2,7 +2,7 @@
 <sub>
 <img src="https://raw.githubusercontent.com/conceptualspace/yet-another-speed-dial/master/src/icons/icon32.png" height="32" width="32">
 </sub>
-Yet Another Speed Dial
+My Yet Another Speed Dial
 </h1>
 
 <h1>
@@ -19,6 +19,10 @@ A better new tab page and bookmark manager (speed dial) that respects your priva
 - Lightning fast UI: no ads, trackers, or bs
 
 ![alt tag](https://github.com/conceptualspace/yet-another-speed-dial/raw/master/assets/screenshot.png)
+
+## Install in developer mode
+
+No build step is required. Open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and select this repository's `src` directory. Disable the store-installed Yet Another Speed Dial first because both extensions replace the new-tab page.
 
 ## FAQ:
 

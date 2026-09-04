@@ -668,11 +668,11 @@ function reloadFolders() {
 async function handleTabCreated(tab) {
     if (tab && tab.pendingUrl && tab.pendingUrl.startsWith('chrome://startpageshared/')) {
         chrome.tabs.update(tab.id, { 
-            url: chrome.runtime.getURL('index.html') 
+            url: chrome.runtime.getURL('index.html')
         });
     } else if (tab && tab.url && tab.url.startsWith('opera://startpageshared/')) {
         chrome.tabs.update(tab.id, { 
-            url: chrome.runtime.getURL('index.html') 
+            url: chrome.runtime.getURL('index.html')
         });
     }
 }

@@ -1,6 +1,7 @@
 :root {
     --color: #ffffff;
     --yasd-blue: rgb(99, 212, 248);
+    --yasd-active-color: #ff4d4d;
     --title-opacity: 1;
     --show-folders: none;
     --create-dial-display: block;
@@ -512,7 +513,7 @@ h1 {
 
 .folderTitle {
     position: relative;
-    opacity: 0.85;
+    opacity: 0.6;
     font-weight: bold;
     transition: outline 160ms ease, background 160ms ease;
     padding: 4px 6px;
@@ -520,7 +521,7 @@ h1 {
 }
 
 .folderTitle:hover {
-    opacity: 1;
+    opacity: 0.9;
 }
 
 .folderBreadcrumbSeparator,
@@ -570,8 +571,16 @@ h1 {
     outline-offset: 2px;
 }
 
-.activeFolder {
+.folderTitle.activeFolder {
     opacity: 1;
+    color: var(--yasd-active-color);
+    background: color-mix(in srgb, var(--yasd-active-color) 16%, transparent);
+    border-radius: 8px;
+    box-shadow: inset 0 -2px 0 0 var(--yasd-active-color);
+}
+
+.folders-drag-active .folderTitle.activeFolder {
+    box-shadow: none;
 }
 
 #deleteFolderModalName {
