@@ -258,7 +258,24 @@ function getBgColor(image) {
 }
 
 function resizeImage(image, screenshot = false, isFallback = false, topCrop = false) {
-    return new Promise((resolve, reject) => {
+    return new Promise((settle, reject) => {
+        // a stalled image load must not block the rest of the thumbnails
+        const timeoutId = setTimeout(() => resolve(), 10000);
+        const resolve = (result) => {
+            clearTimeout(timeoutId);
+            settle(result);
+        };
+
+        // an exception in a load handler (ex. toDataURL on a tainted canvas) would leave the promise pending forever
+        const guard = (handler) => function () {
+            try {
+                handler.call(this);
+            } catch (err) {
+                console.log(err);
+                resolve();
+            }
+        };
+
         if (!image || !image.length) {
             return resolve();
         }
@@ -288,10 +305,10 @@ function resizeImage(image, screenshot = false, isFallback = false, topCrop = fa
                 resolve();
             };
             
-            img.onload = function() {
+            img.onload = guard(function() {
                 let canvas = document.createElement('canvas');
                 let ctx = canvas.getContext('2d');
-                
+
                 // Set canvas to target size for SVGs
                 canvas.width = targetWidth;
                 canvas.height = targetHeight;
@@ -305,8 +322,10 @@ function resizeImage(image, screenshot = false, isFallback = false, topCrop = fa
                 
                 const newDataURI = canvas.toDataURL('image/webp', 0.86);
                 resolve(newDataURI);
-            };
-            
+            });
+
+            // without cors a cross-origin redirect (ex. github raw) taints the canvas
+            img.crossOrigin = "Anonymous";
             img.src = image;
             return;
         }
@@ -324,7 +343,7 @@ function resizeImage(image, screenshot = false, isFallback = false, topCrop = fa
             resolve();
         };
 
-        img.onload = function () {
+        img.onload = guard(function () {
             let sWidth = this.naturalWidth || this.width;
             let sHeight = this.naturalHeight || this.height;
 
@@ -412,7 +431,7 @@ function resizeImage(image, screenshot = false, isFallback = false, topCrop = fa
                 // discard images < 96px
                 resolve();
             }
-        };
+        });
 
         img.crossOrigin = "Anonymous";
         img.src = image;
