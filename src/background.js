@@ -5,7 +5,6 @@
 'use strict';
 
 const THUMBNAIL_CANDIDATES_KEY_PREFIX = 'thumbnailCandidates:';
-const THUMBNAIL_PORT_NAME = 'thumbnailBatches';
 // storage key holding the id of a bookmarks folder adopted as the speed dial root
 const SPEED_DIAL_FOLDER_KEY = 'speedDialFolderId';
 
@@ -44,30 +43,6 @@ function buildThumbnailStorageUpdate(url, images, bgColor) {
     };
 }
 
-async function migrateLegacyThumbnailRecords(results) {
-    const updates = {};
-
-    for (const [url, storedData] of Object.entries(results)) {
-        if (!Array.isArray(storedData?.thumbnails) || storedData.thumbnail) continue;
-
-        const thumbnail = getSelectedThumbnail(storedData);
-        if (!thumbnail) continue;
-
-        updates[url] = {
-            thumbnail,
-            bgColor: storedData.bgColor
-        };
-        updates[getThumbnailCandidatesKey(url)] = {
-            thumbnails: [...new Set(storedData.thumbnails.filter(image => image && image !== thumbnail))]
-                .slice(0, 4)
-        };
-    }
-
-    if (Object.keys(updates).length) {
-        await chrome.storage.local.set(updates);
-    }
-}
-
 
 // EVENT LISTENERS //
 
@@ -83,7 +58,6 @@ chrome.action.onClicked.addListener(handleBrowserAction);
 chrome.contextMenus.onClicked.addListener(handleContextMenuClick);
 
 chrome.runtime.onMessage.addListener(handleMessages);
-chrome.runtime.onConnect.addListener(handleThumbnailPortConnected);
 chrome.runtime.onInstalled.addListener(handleInstalled);
 
 // Add tab listeners for Opera and browsers that don't support chrome_url_overrides
@@ -116,70 +90,6 @@ async function handleMessages(message) {
 			console.warn(`Unexpected message type received: '${message.type}'.`);
 			break;
 	}
-}
-
-// thumbnails stream back over the requesting page's port; a broadcast would fan
-// them out to every open tab
-function handleThumbnailPortConnected(port) {
-    if (port.name !== THUMBNAIL_PORT_NAME) return;
-
-    let connected = true;
-    port.onDisconnect.addListener(() => connected = false);
-    const post = (message) => {
-        if (!connected) return;
-        try {
-            port.postMessage(message);
-        } catch (error) {
-            connected = false;
-        }
-    };
-
-    port.onMessage.addListener(async message => {
-        if (message.type !== 'getThumbs') return;
-        await handleGetThumbs(message.data, thumbs => post({ type: 'thumbBatch', data: thumbs }));
-        post({ type: 'thumbBatchDone' });
-    });
-}
-
-async function handleGetThumbs(data, sendBatch, batchSize = 50) {
-    let bookmarks = data.filter(bookmark => bookmark.url?.startsWith("http") || bookmark.url?.startsWith("file:") || bookmark.url?.startsWith("chrome:"));
-
-    if (!bookmarks.length) return;
-
-    // Fetch all thumbnails in batches
-    for (let i = 0; i < bookmarks.length; i += batchSize) {
-        let batch = bookmarks.slice(i, i + batchSize);
-
-        // Get multiple URLs at once
-        let urls = batch.map(bookmark => bookmark.url);
-        let results = await chrome.storage.local.get(urls);
-
-        let thumbs = batch
-            .map(bookmark => {
-                let storedData = results[bookmark.url];
-                if (!storedData) return null;
-				const thumbnail = getSelectedThumbnail(storedData);
-				if (!thumbnail) return null;
-
-                return {
-                    id: bookmark.id,
-                    parentId: bookmark.parentId,
-                    url: bookmark.url,
-                    thumbnail,
-                    bgColor: storedData.bgColor
-                };
-            })
-            .filter(thumb => thumb !== null); // Remove nulls if some bookmarks have no stored data
-
-        if (thumbs.length) {
-            sendBatch(thumbs);
-        }
-
-		await migrateLegacyThumbnailRecords(results);
-
-    	// Short delay to avoid overwhelming message passing
-    	await new Promise(resolve => setTimeout(resolve, 5));
-    }
 }
 
 async function handleBookmarkChanged(id, info) {
@@ -301,7 +211,7 @@ function toggleBookmarkCreatedListener(data) {
 
 async function handleOffscreenFetchDone(data, forcePageReload) {
 	//console.log(data);
-	saveThumbnails(data.url, data.id, data.parentId, data.thumbs, data.bgColor, forcePageReload);
+	saveThumbnails(data.url, data.id, data.parentId, data.thumbs, data.bgColor, forcePageReload, data.title);
 }
 
 async function handleManualRefresh(data) {
@@ -384,7 +294,7 @@ const capturePopupScreenshot = (url) => {
 
 async function handleRefreshAll(data) {
     async function refreshBatch(bookmarks, index = 0, retries = 2) {
-        const batchSize = 200;
+        const batchSize = data.batchSize || 200;
         const delay = 10000;
         const batch = bookmarks.slice(index, index + batchSize);
     
@@ -410,6 +320,42 @@ async function handleRefreshAll(data) {
     }
 
     refreshBatch(data.bookmarks);
+}
+
+async function captureMissingSpeedDialThumbnails() {
+    const bookmarks = await chrome.bookmarks.search({ title: 'Speed Dial' });
+    const folder = (bookmarks || []).find(isBookmarkFolder);
+    if (!folder) return;
+
+    const [root] = await chrome.bookmarks.getSubTree(folder.id);
+    const dials = [];
+    const seenUrls = new Set();
+
+    (function collect(children) {
+        for (const child of children || []) {
+            if (child.url) {
+                if (isSupportedUrl(child.url) && !seenUrls.has(child.url)) {
+                    seenUrls.add(child.url);
+                    dials.push({ url: child.url, id: child.id, parentId: child.parentId });
+                }
+            } else {
+                collect(child.children);
+            }
+        }
+    })(root?.children || []);
+
+    if (!dials.length) return;
+
+    const stored = await chrome.storage.local.get(dials.map(dial => dial.url));
+    const missing = dials.filter(dial => !getSelectedThumbnail(stored[dial.url]));
+    if (missing.length) {
+        // this covers the whole tree rather than one folder, so spread the load out more
+        handleRefreshAll({ bookmarks: missing, batchSize: 100 });
+    }
+}
+
+function isSupportedUrl(url) {
+    return url.startsWith('https://') || url.startsWith('http://') || url.startsWith('file://') || url.startsWith('chrome://');
 }
 
 async function getSpeedDialFolderId() {
@@ -493,7 +439,8 @@ async function handleInstalled(details) {
     if (details.reason === "install") {
         // set uninstall URL
         chrome.runtime.setUninstallURL("https://forms.gle/6vJPx6eaMV5xuxQk9");
-        // todo: detect existing speed dial folder
+        // a synced speed dial folder may already exist; its dials have no thumbnails on this device yet
+        captureMissingSpeedDialThumbnails().catch(err => console.log(err));
     } else if (details.reason === 'update') {
         // perform any migrations here...
         await runMigrations(details.previousVersion);
@@ -620,13 +567,34 @@ async function getThumbnails(url, id, parentId, options = {quickRefresh: false, 
 	});
 }
 
-async function saveThumbnails(url, id, parentId, images, bgColor, forcePageReload=false) {
+// dials added from the new tab page are created with the url as their title
+function isUrlTitle(title, url) {
+	if (!title || title === url) return true;
+	try {
+		return new URL(title).href === url;
+	} catch (err) {
+		return false;
+	}
+}
+
+async function applyPageTitle(id, url, title) {
+	const [bookmark] = await chrome.bookmarks.get(id).catch(() => []);
+	if (!bookmark || bookmark.url !== url || bookmark.title === title || !isUrlTitle(bookmark.title, url)) return;
+	await chrome.bookmarks.update(id, { title }).catch(() => {});
+}
+
+async function saveThumbnails(url, id, parentId, images, bgColor, forcePageReload=false, title=null) {
 	let stored = images && images.length ? buildThumbnailStorageUpdate(url, images, bgColor) : null;
 	if (stored) {
 		await chrome.storage.local.set(stored);
 	}
 	// refresh open new tab page
 	if (forcePageReload) {
+		// new dial: adopt the page title before the reload so it renders in one pass.
+		// runs after the thumbs are stored so the resulting onChanged doesnt refetch
+		if (title) {
+			await applyPageTitle(id, url, title);
+		}
 		// we have new sites, reload the page
 		refreshOpen(id, { url });
 	} else {

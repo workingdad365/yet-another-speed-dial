@@ -27,11 +27,11 @@ async function handleMessages(message) {
     let resizedImages = [];
     let thumbs = [];
     let bgColor = null;
-    let title = null;
+    let pageInfo = { title: null };
 
     let url = message.data.url;
 
-    let images = await fetchImages(url, quickRefresh).catch(err => {
+    let images = await fetchImages(url, quickRefresh, pageInfo).catch(err => {
         console.log(err);
     })
 
@@ -75,8 +75,7 @@ async function handleMessages(message) {
         //await saveThumbnails(url, thumbs, bgColor)
     }
 
-    chrome.runtime.sendMessage({target: 'background', type: 'saveThumbnails', data: {url, id, parentId, thumbs, bgColor}, forcePageReload});
-    //return title; //todo: why did i do this?
+    chrome.runtime.sendMessage({target: 'background', type: 'saveThumbnails', data: {url, id, parentId, thumbs, bgColor, title: pageInfo.title}, forcePageReload});
 
       //chrome.runtime.sendMessage(images);
 }
@@ -468,7 +467,20 @@ function shouldTopCropGoogleThumb(url) {
     }
 }
 
-async function fetchImages(url, quickRefresh) {
+function getPageTitle(doc) {
+    const candidates = [
+        doc.querySelector('title')?.textContent,
+        doc.querySelector('meta[property="og:title"]')?.getAttribute('content')
+    ];
+    for (const candidate of candidates) {
+        const title = candidate?.replace(/\s+/g, ' ').trim();
+        if (title) return title;
+    }
+    return null;
+}
+
+// pageInfo receives the parsed page title so it can ride along with the images
+async function fetchImages(url, quickRefresh, pageInfo = {}) {
 
     if (url.startsWith('file://')) {
         return ['img/file.png'];
@@ -500,9 +512,14 @@ async function fetchImages(url, quickRefresh) {
             return(images);
         }
     } else {
+        // favicon fallback
         images.push(`https://cdn.brandfetch.io/domain/${hostname}/w/512/logo/fallback/404/?c=key`);
         images.push(`https://cdn.brandfetch.io/domain/${hostname}/w/512/icon/fallback/404/?c=key`);
+        images.push(`https://t0.gstatic.com/faviconV2?client=SOCIAL&type=FAVICON&fallback_opts=TYPE,SIZE,URL&url=${encodeURIComponent(urlObj.origin)}&size=256`);
     }
+
+    // everything above is a generic fallback, not evidence the scrape found anything
+    const fallbackCount = images.length;
 
     // avoid duplicates and preserve the precedence of images
     function insert(imageUrl) {
@@ -555,6 +572,8 @@ async function fetchImages(url, quickRefresh) {
             const text = await response.text();
             const parser = new DOMParser();
             const doc = parser.parseFromString(text, 'text/html');
+
+            pageInfo.title = getPageTitle(doc);
 
             // check for svg logo and convert to data url
             let svgElements = doc.querySelectorAll('svg');
@@ -669,7 +688,7 @@ async function fetchImages(url, quickRefresh) {
 
             // if we havent had much luck with images, lets check the manifest and style sheets
             // we dont do so during a quick refresh to avoid fetching extra resources
-            if (images.length < 5 && !quickRefresh) {
+            if (images.length === fallbackCount && !quickRefresh) {
                 // web application manifest icon
                 let manifestLink = doc.querySelector('link[rel="manifest"]');
                 if (manifestLink && manifestLink.getAttribute('href')) {

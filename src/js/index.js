@@ -251,7 +251,7 @@ let defaults = {
     maxCols: '100',
     defaultSort: 'first',
     textColor: '#ffffff',
-    dialSize: 'large',
+    dialSize: 'medium',
     dialRatio: 'wide',
     folderStyle: 'tabs',
     currentFolder: null,
@@ -1185,17 +1185,47 @@ function createNewDialButton(parentId) {
     return aNewDial;
 }
 
-function requestThumbnails(bookmarks) {
-    const port = chrome.runtime.connect({ name: 'thumbnailBatches' });
-    port.onMessage.addListener(message => {
-        if (message.type === 'thumbBatch') {
-            setBackgroundImages(message.data);
+async function migrateLegacyThumbnailRecords(results) {
+    const updates = {};
+
+    for (const [url, storedData] of Object.entries(results)) {
+        if (!Array.isArray(storedData?.thumbnails) || storedData.thumbnail) continue;
+
+        const thumbnail = getSelectedThumbnail(storedData);
+        if (!thumbnail) continue;
+
+        updates[url] = {
+            thumbnail,
+            bgColor: storedData.bgColor
+        };
+        updates[getThumbnailCandidatesKey(url)] = {
+            thumbnails: [...new Set(storedData.thumbnails.filter(image => image && image !== thumbnail))]
+                .slice(0, 4)
+        };
+    }
+
+    if (Object.keys(updates).length) {
+        await chrome.storage.local.set(updates);
+    }
+}
+
+// read straight from storage (refactored from previous service worker)
+async function requestThumbnails(bookmarks, batchSize = 50) {
+    for (let i = 0; i < bookmarks.length; i += batchSize) {
+        const batch = bookmarks.slice(i, i + batchSize);
+        const stored = await chrome.storage.local.get(batch.map(bookmark => bookmark.url));
+        const thumbs = batch
+            .map(({ element, url }) => ({
+                element,
+                thumb: { thumbnail: getSelectedThumbnail(stored[url]), bgColor: stored[url]?.bgColor }
+            }))
+            .filter(({ thumb }) => thumb.thumbnail);
+        if (thumbs.length) {
+            batchApplyImages(thumbs);
             hideToast();
-        } else if (message.type === 'thumbBatchDone') {
-            port.disconnect();
         }
-    });
-    port.postMessage({ type: 'getThumbs', data: bookmarks });
+        migrateLegacyThumbnailRecords(stored).catch(error => console.log(error));
+    }
 }
 
 async function printBookmarks(bookmarks, parentId, { immediateInsert = false } = {}) {
@@ -1283,7 +1313,7 @@ async function printBookmarks(bookmarks, parentId, { immediateInsert = false } =
                     content.id = bookmark.id;
                     content.classList.add('tile-content');
                     content.style.backgroundColor = 'rgba(255, 255, 255, 0.5)';
-                    thumbRequests.push({ id: bookmark.id, parentId, url: bookmark.url });
+                    thumbRequests.push({ element: content, url: bookmark.url });
                 }
 
                 let title = document.createElement('div');
@@ -3672,6 +3702,13 @@ importFileInput.onchange = function (event) {
     let filereader = new FileReader();
 
     filereader.onload = function (event) {
+        // netscape bookmarks html: exported by chrome, edge, brave, opera, vivaldi, firefox, safari
+        if (isNetscapeBookmarksHtml(event.target.result)) {
+            chrome.runtime.sendMessage({ target: 'background', type: 'toggleBookmarkCreatedListener', data: { enable: false } });
+            importFromNetscapeHtml(event.target.result);
+            return;
+        }
+
         let json = parseJson(event);
         if (!json) return;
 
@@ -3696,6 +3733,123 @@ importFileInput.onchange = function (event) {
         filereader.readAsText(event.target.files[0]);
     }
 };
+
+function isNetscapeBookmarksHtml(text) {
+    if (typeof text !== 'string' || !text.trimStart().startsWith('<')) return false;
+    const head = text.slice(0, 2048);
+    return /<!DOCTYPE NETSCAPE-Bookmark-file-1>/i.test(head) || (/<DL>/i.test(head) && /<DT>/i.test(text));
+}
+
+// the format nests <DT><H3>title</H3><DL>children</DL> for folders and <DT><A HREF>title</A> for bookmarks.
+// browsers emit the closing </DT> and </p> tags inconsistently, so walk the DOM rather than the markup
+function parseNetscapeFolder(dl) {
+    const children = [];
+    for (const dt of dl.children) {
+        if (dt.tagName !== 'DT') continue;
+        const heading = dt.querySelector(':scope > h3');
+        if (heading) {
+            const childList = dt.querySelector(':scope > dl');
+            children.push({
+                title: heading.textContent.trim(),
+                toolbar: heading.hasAttribute('personal_toolbar_folder'),
+                children: childList ? parseNetscapeFolder(childList) : []
+            });
+            continue;
+        }
+        const anchor = dt.querySelector(':scope > a[href]');
+        if (anchor) {
+            const url = anchor.getAttribute('href').trim();
+            if (!url) continue;
+            children.push({ title: anchor.textContent.trim() || url, url });
+        }
+    }
+    return children;
+}
+
+function findNetscapeFolder(nodes, predicate) {
+    for (const node of nodes) {
+        if (Array.isArray(node.children)) {
+            if (predicate(node)) return node;
+            const match = findNetscapeFolder(node.children, predicate);
+            if (match) return match;
+        }
+    }
+    return null;
+}
+
+function pickNetscapeImportRoot(tree) {
+    // a folder named speed dial is what the user wants regardless of where the browser put it
+    // (opera keeps its dials there; chrome users may have created one for yasd)
+    const speedDial = findNetscapeFolder(tree, node => node.title.toLowerCase() === 'speed dial');
+    if (speedDial) return speedDial.children;
+
+    // otherwise the bookmarks bar is the closest thing to a speed dial
+    const toolbar = findNetscapeFolder(tree, node => node.toolbar);
+    if (toolbar) return toolbar.children;
+
+    // firefox wraps everything in a single root; unwrap it so its top-level folders become subfolders
+    if (tree.length === 1 && Array.isArray(tree[0].children)) return tree[0].children;
+
+    return tree;
+}
+
+function importFromNetscapeHtml(html) {
+    let nodes;
+    try {
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const root = doc.querySelector('dl');
+        if (!root) throw new Error('no bookmark list found');
+        nodes = pickNetscapeImportRoot(parseNetscapeFolder(root));
+    } catch (err) {
+        console.log(err);
+        chrome.runtime.sendMessage({ target: 'background', type: 'toggleBookmarkCreatedListener', data: { enable: true } });
+        importExportStatus.innerText = "Error! Unable to parse file.";
+        return;
+    }
+
+    const createdBookmarks = [];
+
+    async function createDials(parentId, dials) {
+        const existingUrls = new Set((await chrome.bookmarks.getChildren(parentId)).map(child => child.url));
+        for (const dial of dials) {
+            if (!isSupportedDial(dial) || existingUrls.has(dial.url)) continue;
+            existingUrls.add(dial.url);
+            createdBookmarks.push(await chrome.bookmarks.create({
+                title: dial.title,
+                url: dial.url,
+                parentId
+            }));
+        }
+    }
+
+    async function resolveFolder(parentId, title) {
+        const siblings = await chrome.bookmarks.getChildren(parentId);
+        const existing = siblings.find(node => isBookmarkFolder(node) && node.title === title);
+        if (existing) return existing.id;
+        return (await chrome.bookmarks.create({ title, parentId })).id;
+    }
+
+    async function importNodes(parentId, children) {
+        await createDials(parentId, children.filter(node => !Array.isArray(node.children)));
+
+        for (const folder of children.filter(node => Array.isArray(node.children))) {
+            const folderId = await resolveFolder(parentId, folder.title);
+            await importNodes(folderId, folder.children);
+        }
+    }
+
+    return importNodes(speedDialId, nodes).then(() => {
+        hideModals();
+        processRefresh();
+        chrome.runtime.sendMessage({ target: 'background', type: 'toggleBookmarkCreatedListener', data: { enable: true } });
+        // browsers export favicons at best, so fetch proper thumbnails
+        refreshImportedThumbnails(createdBookmarks);
+    }).catch(err => {
+        console.log(err);
+        chrome.runtime.sendMessage({ target: 'background', type: 'toggleBookmarkCreatedListener', data: { enable: true } });
+        importExportStatus.innerText = "Bookmarks import error! Unable to create folders.";
+    });
+}
 
 function importFromSD2(json) {
     let bookmarks = json.dials.map(dial => ({
@@ -4564,7 +4718,7 @@ function preloadImage(url) {
 
 function setBackgroundImages(thumbnails) {
     const elementsToUpdate = [];
-    const observers = new Map();
+    const pendingByParent = new Map();
 
     thumbnails.forEach(thumb => {
         const element = document.getElementById(thumb.id);
@@ -4578,28 +4732,34 @@ function setBackgroundImages(thumbnails) {
         if (element) {
             elementsToUpdate.push({ element, thumb });
         } else if (!previewElements?.size) {
-            let observer = observers.get(thumb.parentId);
-            if (!observer) {
+            let pending = pendingByParent.get(thumb.parentId);
+            if (!pending) {
                 const parentElement = document.getElementById(thumb.parentId);
                 if (!parentElement) return; // Skip if parent is missing
 
-                observer = new MutationObserver((mutations, obs) => {
-                    thumbnails.forEach(t => {
-                        const el = document.getElementById(t.id);
+                pending = [];
+                pendingByParent.set(thumb.parentId, pending);
+                // tiles land in batches, so a single mutation may not include every pending tile
+                const observer = new MutationObserver((mutations, obs) => {
+                    const found = [];
+                    for (let i = pending.length - 1; i >= 0; i--) {
+                        const el = document.getElementById(pending[i].id);
                         if (el) {
-                            elementsToUpdate.push({ element: el, thumb: t });
+                            found.push({ element: el, thumb: pending.splice(i, 1)[0] });
                         }
-                    });
+                    }
 
-                    if (elementsToUpdate.length) {
-                        batchApplyImages(elementsToUpdate);
+                    if (found.length) {
+                        batchApplyImages(found);
+                    }
+                    if (!pending.length) {
                         obs.disconnect();
                     }
                 });
 
                 observer.observe(parentElement, { childList: true, subtree: true });
-                observers.set(thumb.parentId, observer);
             }
+            pending.push(thumb);
         }
     });
 

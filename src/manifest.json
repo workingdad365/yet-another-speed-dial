@@ -3,7 +3,7 @@
   "name": "My Yet Another Speed Dial",
   "description": "__MSG_extensionDescription__",
   "default_locale": "en",
-  "version": "3.16.3",
+  "version": "3.16.6",
   "author": "dev@conceptualspace.net",
   "icons": {
     "16": "icons/icon16.png",
